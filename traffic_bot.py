@@ -20,7 +20,7 @@ from selenium.webdriver.support.wait import WebDriverWait
 from urllib3.exceptions import MaxRetryError
 from user_agent import generate_user_agent
 
-from .blocked import BLOCKED
+from blocked import BLOCKED
 
 sec = SystemRandom()
 
@@ -194,7 +194,7 @@ class TrafficBot:
         self.driver.delete_all_cookies()
 
         # Install Alexa sidebar plugin
-        if 410 < sec.randint(0, 1000) < 580:
+        if 410 < sec.randint(0, 1000) < 680:
             self.logger.info("Installing Alexa toolbar plugin!")
             self.driver.install_addon("/home/daen/PycharmProjects/trafficbot_cga/firefox/extensions/alxf-4.0.0.xpi")
 
@@ -382,7 +382,7 @@ class TrafficBot:
 
     def per_impression_chance_to_click_banner(self):
         # 1% chance Bot clicks on ad banner
-        if 450 < sec.randint(0, 1000) < 550:
+        if 470 < sec.randint(0, 1000) < 530:
             self.clicks_ad = True
         else:
             self.clicks_ad = False
@@ -614,11 +614,21 @@ def standard_multiprocessing():
         pq.put(i)
     try:
         while True:
-            TrafficBotProcess(pq, pq.get(), True).start().join()
-            TrafficBotProcess(pq, pq.get(), True).start().join()
-            TrafficBotProcess(pq, pq.get(), True).start().join()
-            TrafficBotProcess(pq, pq.get(), True).start().join()
-            TrafficBotProcess(pq, pq.get(), True).start().join()
+            processes = []
+            p0 = TrafficBotProcess(pq, pq.get(), True)
+            processes.append(p0)
+            p1 = TrafficBotProcess(pq, pq.get(), True)
+            processes.append(p1)
+            p2 = TrafficBotProcess(pq, pq.get(), True)
+            processes.append(p2)
+            p3 = TrafficBotProcess(pq, pq.get(), True)
+            processes.append(p3)
+            p4 = TrafficBotProcess(pq, pq.get(), True)
+            processes.append(p4)
+
+            [p.start() for p in processes]
+            [p.join() for p in processes]
+
 
     except KeyboardInterrupt:
         sys.exit()
