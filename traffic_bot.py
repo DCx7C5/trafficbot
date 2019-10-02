@@ -239,7 +239,6 @@ class TrafficBot:
         elem.click()
 
     def handle_google_ref(self):
-
         site_and_exit = sec.choice(self.site_data[self.site]["refs"]["google"])
         site = site_and_exit[0]
         locator = site_and_exit[1]
@@ -551,51 +550,6 @@ class TrafficBotProcess(TrafficBot, Process):
         TrafficBot.__init__(self, *args, **kwargs)
 
 
-class TrafficBotManager:
-
-    def __init__(self, proc_count, headless):
-        self.process_q = Queue()
-        self.proc_count = proc_count
-        job_list = [
-            (2, 'https://190.2.153.131:38240'),
-            (5, 'https://190.2.153.131:38243'),
-            (10, 'https://190.2.153.131:38304'),
-            (9, 'https://190.2.153.131:38303'),
-            (7, 'https://190.2.153.131:38301'),
-            (4, 'https://190.2.153.131:38242'),
-            (1, 'https://190.2.153.131:38239'),
-            (8, 'https://190.2.153.131:38302'),
-            (3, 'https://190.2.153.131:38241'),
-            (6, 'https://190.2.153.131:38244')]
-        sec.shuffle(job_list)
-        for i in job_list:
-            self.process_q.put(i)
-        self.headless = headless
-
-    def start_bots(self):
-        try:
-            while True:
-                proc_dict = {
-                    f'{r}': TrafficBotProcess(
-                        self.process_q,
-                        self.process_q.get(),
-                        self.headless) for r in range(self.proc_count)
-                }
-                for r in proc_dict:
-                    proc_dict[r].start()
-                    sleep(2)
-                for r in proc_dict:
-                    proc_dict[r].join()
-        except KeyboardInterrupt:
-            sleep(1)
-
-    def interactive(self):
-        return TrafficBot(
-            self.process_q,
-            self.process_q.get(),
-            self.headless)
-
-
 def standard_multiprocessing():
     pq = Queue()
     job_list = [
@@ -614,23 +568,28 @@ def standard_multiprocessing():
         pq.put(i)
     try:
         while True:
-            processes = []
             p0 = TrafficBotProcess(pq, pq.get(), True)
-            processes.append(p0)
             p1 = TrafficBotProcess(pq, pq.get(), True)
-            processes.append(p1)
             p2 = TrafficBotProcess(pq, pq.get(), True)
-            processes.append(p2)
             p3 = TrafficBotProcess(pq, pq.get(), True)
-            processes.append(p3)
             p4 = TrafficBotProcess(pq, pq.get(), True)
-            processes.append(p4)
 
-            for p in processes:
-                p.start()
-                sleep(2)
-            for p in processes:
-                p.join()
+            p0.start()
+            sleep(2)
+            p1.start()
+            sleep(2)
+            p2.start()
+            sleep(2)
+            p3.start()
+            sleep(2)
+            p4.start()
+            sleep(2)
+
+            p0.join()
+            p1.join()
+            p2.join()
+            p3.join()
+            p4.join()
 
     except KeyboardInterrupt:
         sys.exit()
