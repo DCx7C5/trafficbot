@@ -626,9 +626,11 @@ def standard_multiprocessing():
             p4 = TrafficBotProcess(pq, pq.get(), True)
             processes.append(p4)
 
-            [p.start() for p in processes]
-            [p.join() for p in processes]
-
+            for p in processes:
+                p.start()
+                sleep(2)
+            for p in processes:
+                p.join()
 
     except KeyboardInterrupt:
         sys.exit()
