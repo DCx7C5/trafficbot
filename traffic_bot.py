@@ -196,7 +196,7 @@ class TrafficBot:
         # Install Alexa sidebar plugin
         if 410 < sec.randint(0, 1000) < 680:
             self.logger.info("Installing Alexa toolbar plugin!")
-            self.driver.install_addon("/home/daen/PycharmProjects/trafficbot_cga/firefox/extensions/alxf-4.0.0.xpi")
+            self.driver.install_addon("/home/daen/trafficbot/firefox/extensions/alxf-4.0.0.xpi")
 
         self.ref = None
 
@@ -393,6 +393,7 @@ class TrafficBot:
         banner_0 = self.banner_is_present_728x90_coinzilla()
         if banner_0:
             possibles.append(banner_0)
+	    possibles.append(banner_0)
         banner_1 = self.banner_is_present_sticky_footer()
         if banner_1:
             possibles.append(banner_1)
@@ -402,7 +403,6 @@ class TrafficBot:
             possibles.append(banner_2)
         banner_3 = self.banner_is_present_alert()
         if banner_3:
-            possibles.append(banner_3)
             possibles.append(banner_3)
         if len(possibles) == 0:
             self.logger.info("No banners found")
@@ -572,7 +572,7 @@ def standard_multiprocessing():
             p1 = TrafficBotProcess(pq, pq.get(), True)
             p2 = TrafficBotProcess(pq, pq.get(), True)
             p3 = TrafficBotProcess(pq, pq.get(), True)
-            p4 = TrafficBotProcess(pq, pq.get(), True)
+            #p4 = TrafficBotProcess(pq, pq.get(), True)
 
             p0.start()
             sleep(2)
@@ -582,14 +582,14 @@ def standard_multiprocessing():
             sleep(2)
             p3.start()
             sleep(2)
-            p4.start()
-            sleep(2)
+            #p4.start()
+            #sleep(2)
 
             p0.join()
             p1.join()
             p2.join()
             p3.join()
-            p4.join()
+            #p4.join()
 
     except KeyboardInterrupt:
         sys.exit()
