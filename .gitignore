@@ -1,2 +1,7 @@
+# Folders to ignore
+.idea/
 /firefox/
-/geckodriver.log
+
+# Files to ignore
+firefox.tar.gz
+geckodriver.log
