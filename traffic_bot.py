@@ -393,7 +393,7 @@ class TrafficBot:
         banner_0 = self.banner_is_present_728x90_coinzilla()
         if banner_0:
             possibles.append(banner_0)
-	    possibles.append(banner_0)
+            possibles.append(banner_0)
         banner_1 = self.banner_is_present_sticky_footer()
         if banner_1:
             possibles.append(banner_1)
