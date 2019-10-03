@@ -1,4 +1,5 @@
 BLOCKED = [
+    'cryptogiveaways.de',
     'coinminingpool.org',
     'cryptowho.de',
     'twimg.com',
