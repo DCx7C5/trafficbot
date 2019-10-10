@@ -2,6 +2,7 @@ BLOCKED = [
     'cryptogiveaways.de',
     'coinminingpool.org',
     'cryptowho.de',
+    'exploreoasis.com'
     'twimg.com',
     'wheretomine.io',
     'a.pub.network',
