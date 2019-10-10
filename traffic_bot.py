@@ -145,10 +145,10 @@ class TrafficBot:
             ))
 
         self.profile.set_preference('general.useragent.override', self.active_ua)
-        self.profile.set_preference('network.proxy.http', f'{self.proxy_ip}')
-        self.profile.set_preference('network.proxy.http_port', self.proxy_port)
-        self.profile.set_preference('network.proxy.ssl', f'{self.proxy_ip}')
-        self.profile.set_preference('network.proxy.ssl_port', self.proxy_port)
+        self.profile.set_preference('network.proxy.socks_remote_dns', True)
+        self.profile.set_preference('network.proxy.socks_version', 5)
+        self.profile.set_preference('network.proxy.socks_port', self.proxy_port)
+        self.profile.set_preference('network.proxy.socks', f'{self.proxy_ip}')
         self.profile.set_preference('network.proxy.type', 1)
         self.profile.set_preference('network.proxy.no_proxies_on', ",".join(BLOCKED))
         self.profile.update_preferences()
@@ -496,8 +496,8 @@ class TrafficBot:
                 links_in_banner.remove(_link)
 
     def get_info_from_proxy_ip(self) -> dict:
-        _proxy = {'http': f'http://{self.proxy_ip}:{self.proxy_port}',
-                  'https': f'https://{self.proxy_ip}:{self.proxy_port}'}
+        _proxy = {'http': f'socks5://{self.proxy_ip}:{self.proxy_port}',
+                  'https': f'socks5://{self.proxy_ip}:{self.proxy_port}'}
         resp = None
         api_key_0 = "c35452a139fb4a8b89d7d0c10c02533f"
         api_key_1 = "c6d49ec452f24f59adb58a8c7ea59935"
@@ -568,27 +568,27 @@ def standard_multiprocessing():
         pq.put(i)
     try:
         while True:
-            p0 = TrafficBotProcess(pq, pq.get(), True)
-            p1 = TrafficBotProcess(pq, pq.get(), True)
-            p2 = TrafficBotProcess(pq, pq.get(), True)
-            p3 = TrafficBotProcess(pq, pq.get(), True)
+            p0 = TrafficBotProcess(pq, pq.get(), False)
+            #p1 = TrafficBotProcess(pq, pq.get(), True)
+            #p2 = TrafficBotProcess(pq, pq.get(), True)
+            #p3 = TrafficBotProcess(pq, pq.get(), True)
             #p4 = TrafficBotProcess(pq, pq.get(), True)
 
             p0.start()
             sleep(2)
-            p1.start()
-            sleep(2)
-            p2.start()
-            sleep(2)
-            p3.start()
-            sleep(2)
+            #p1.start()
+            #sleep(2)
+            #p2.start()
+            #sleep(2)
+            #p3.start()
+            #sleep(2)
             #p4.start()
             #sleep(2)
 
             p0.join()
-            p1.join()
-            p2.join()
-            p3.join()
+            #p1.join()
+            #p2.join()
+            #p3.join()
             #p4.join()
 
     except KeyboardInterrupt:
