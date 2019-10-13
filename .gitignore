@@ -5,3 +5,5 @@
 # Files to ignore
 firefox.tar.gz
 geckodriver.log
+.lock
+.lock2
