@@ -6,7 +6,7 @@ import logging
 import requests
 import coloredlogs
 from multiprocessing import Process, Queue, Pipe, Lock
-
+from socks import ProxyError
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
 
@@ -19,12 +19,14 @@ from selenium.webdriver.support.wait import WebDriverWait
 from urllib3.exceptions import InsecureRequestWarning
 from user_agent import generate_user_agent
 from selenium.webdriver.remote.remote_connection import LOGGER
-from filelock import FileLock
 
 from blocked import BLOCKED
 from traffic_sql import get_website_settings_sql, update_bot_sessions_finish_sql, \
     update_bot_sessions_start_sql, get_referrer_links_sql, get_website_locators_sql, create_connection_pool, \
     proxy_ext_ip_was_used, get_geoip_info_sql
+
+
+
 
 sec = SystemRandom()
 
@@ -32,13 +34,14 @@ LOGGER.setLevel(logging.WARNING)
 CWD = os.getcwd()
 pq = Queue()
 
-PXY_LOCK = FileLock(f"{CWD}/.lock")
-KPAL_LOCK = FileLock(f"{CWD}/.lock2")
-
-logger = logging.getLogger ('TRAFFICBOT')
-coloredlogs.install (
+logger = logging.getLogger('TRAFFICBOT')
+urlliblog = logging.getLogger('urllib3')
+sockslog = logging.getLogger('socks')
+sockslog.setLevel(logging.WARNING)
+urlliblog.setLevel(logging.CRITICAL)
+coloredlogs.install(
     level=logging.INFO,
-    fmt=f'%(asctime)-20s- %(name)-5s - %(process)-6s- %(levelname)-7s - %(message)s',
+    fmt=f'%(asctime)-20s- %(name)-31s - %(process)-6s- %(levelname)-7s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
@@ -54,6 +57,7 @@ PROXIES = [
     "https://190.2.153.131:38303",
     "https://190.2.153.131:38304"
 ]
+sec.shuffle(PROXIES)
 
 
 def is_xpath_locator(locator_string: str) -> bool:
@@ -102,9 +106,9 @@ class DPP:
     """Daen Protocol Package"""
     def __init__(self, t: str, r: str, ty: str, data):
         self.FROM = t
-        self.FROM_id = t[-1]
+        self.FROM_id_numeric = int(t[-1])
         self.TO = r
-        self.TO_id = r[-1]
+        self.TO_id_numeric = int(r[-1])
         self.TYPE = ty
         self.DATA = data
 
@@ -114,13 +118,11 @@ class TrafficBotProcess(Process):
     def __init__(self, bid: int, database_connection, communication_channel, log, lock_obj, headless=True):
         Process.__init__(self)
         self.id = bid
-        self.name = f'Bot0{self.id}'
+        self.name = 'Bot'
         self.logger = log.getChild(self.name)
         self.lock = lock_obj
         self.dpp_id = f'B{self.id}'
         self.com_chan = communication_channel
-        self.com_chan.send(DPP(self.dpp_id, '0', 'PXY', None))
-        self.proxy = self.com_chan.recv().DATA
         self.db_conn = database_connection
         # Randomly choose site for this Process
         self.website_settings = get_website_settings_sql(self.db_conn)
@@ -132,15 +134,80 @@ class TrafficBotProcess(Process):
 
         self.clicks_ad = False
         self.clicked_ad = 0
+        self.click_ad_allowed = self.website_settings[self.site]["ad_clicks_enabled"]
 
         if headless is True:
             os.environ['MOZ_HEADLESS'] = '1'
 
+        self.proxy = None
+        self.proxy_ip = None
+        self.proxy_port = None
+        self.active_ext_ip = None
+        self.was_used = None
+        self.info_dict = None
+        self.active_country = None
+        self.active_language = None
+        self.active_google_domain = None
+        self.active_ua = generate_user_agent(device_type='desktop')
+        self.is_mobile = False
+        self.error_counter = None
+        self.rotation_time = None
+        self.install_alexa_toolbar = None
+        self.ref_id, self.ref = None, None
+        self.session_id = None
+        self.driver = None
+        self.first_inited = None
+        self.session_created = None
+        self.default_window_handle = None
+
+    def run(self) -> None:
+        try:
+            while not self.first_inited:
+                self.first_init()
+            while not self.session_created:
+                self.create_session()
+            self.ref()
+            time.sleep(sec.randint(2, 8))
+            self.handle_onsite()
+        except ProxyError as pe:
+            with self.lock:
+                self.logger.error(str(pe))
+        except Exception as ex:
+            with self.lock:
+                self.logger.error(str(ex))
+        finally:
+            self.save_session()
+            self.lock.acquire()
+            self.logger.debug('Session saved to database...')
+            self.lock.release()
+            self.close_and_quit()
+            self.lock.acquire()
+            self.logger.debug('Driver session closed and cleaned up...')
+            self.logger.debug('Sending PXY Package to manager...')
+            self.lock.release()
+            self.com_chan.send(DPP(self.dpp_id, '0', 'PXY', self.proxy))
+            self.lock.acquire()
+            self.logger.debug('Sending END Package to instance, waiting for response...')
+            self.lock.release()
+            self.com_chan.send(DPP(self.dpp_id, f'P{self.id}', 'END', True))
+            if self.com_chan.recv().DATA:
+                self.lock.acquire()
+                self.logger.debug('...received response, process stopping...')
+                self.lock.release()
+
+    def first_init(self):
+        with self.lock:
+            self.logger.debug("Requesting new proxy from TrafficBotManager")
+        self.com_chan.send(DPP(self.dpp_id, '0', 'PXY', None))
+        self.proxy = self.com_chan.recv().DATA
+        with self.lock:
+            self.logger.debug(f"Received proxy from TrafficBotManager: {self.proxy}")
         self.proxy_ip = self.proxy.split('//')[1].split(':')[0]
         self.proxy_port = int(self.proxy.split('//')[1].split(':')[1])
 
         self.active_ext_ip = self.get_ip_address_from_cmp()
         self.was_used = proxy_ext_ip_was_used(self.db_conn, self.active_ext_ip)
+
         if self.was_used:
             self.info_dict = get_geoip_info_sql(self.db_conn, self.proxy, self.active_ext_ip)
             self.active_country = self.info_dict['country']
@@ -162,12 +229,10 @@ class TrafficBotProcess(Process):
                 self.is_mobile = False
 
         self.error_counter = 0
-        self.anti_bounce_counter = 0
 
         self.rotation_time = 300
         time.sleep(sec.randint(500, 3000) / 1000)
         # Create browser session
-        self.install_alexa_toolbar = False
 
         self.ref_id, self.ref = choose_fair(
             [
@@ -177,37 +242,31 @@ class TrafficBotProcess(Process):
             ]
         )
 
-        self.session_id = None
-        self.driver = None
         self.session_created = False
-        self.default_window_handle = None
 
-    def run(self) -> None:
-        try:
-            while not self.session_created:
-                self.create_session()
-            self.ref()
-            time.sleep(sec.randint(2, 8))
-            self.handle_onsite()
-        except Exception as ex:
-            with self.lock:
-                self.logger.error(ex)
-        finally:
-            self.save_session()
-            self.logger.debug('Session saved to database...')
-            self.close_and_quit()
-            self.logger.debug('Driver session closed and cleaned up...')
-            self.logger.debug('Sending PXY Package to manager...')
-            self.com_chan.send(DPP(self.dpp_id, '0', 'PXY', self.proxy))
-            self.logger.debug('Sending END Package to instance...')
-            self.com_chan.send(DPP(self.dpp_id, f'P{self.id}', 'END', True))
-            self.logger.debug('...process stopping...')
-
-    def create_session(self):
-        # Install Alexa sidebar plugin
+        # try Install Alexa sidebar plugin
+        self.install_alexa_toolbar = False
         if choose_fair(self.website_settings[self.site]['percent_alexa_tool']):
             self.install_alexa_toolbar = True
 
+        with self.lock:
+            if self.was_used:
+                self.logger.warning(f"Same external IP used in last 10 minutes: {self.proxy}")
+            self.logger.debug(f"Fetched IP geolocation and meta data via {'database.' if self.was_used else 'HTTP request.'}")
+            self.logger.debug(f"Socks5 proxy URL   : {self.proxy}")
+            self.logger.debug(f"External IP address: {self.active_ext_ip}")
+            self.logger.debug(f"Language code      : {self.active_language}")
+            self.logger.debug(f"Country code       : {self.active_country}")
+            self.logger.debug(f"Google domain      ; {self.active_google_domain}")
+            self.logger.debug(f"User agent         : {self.active_ua}")
+            self.logger.debug(f"Is mobile device   : {self.is_mobile}")
+            self.logger.debug(f'Session website    ; {self.site}')
+            self.logger.debug(f'Session refsite    : {self.ref_id}')
+            self.logger.debug(f'Alexa toolbar      : {"Yes" if self.install_alexa_toolbar else "No"}')
+            self.logger.debug(f'Ad click allowed   : {"Yes" if self.click_ad_allowed else "No"}')
+        self.first_inited = True
+
+    def create_session(self):
         profile = FirefoxProfile(f'{CWD}/firefox/profile/{"alexa" if self.install_alexa_toolbar else "user0"}')
         profile.set_preference(
             'intl.accept_languages', '{}en-US;q=0.9,en;q=0.8'.format(
@@ -229,10 +288,16 @@ class TrafficBotProcess(Process):
             firefox_binary=f"{CWD}/firefox/binary/firefox-bin",
             firefox_profile=profile,
         )
-        # if self.was_used and self.info_dict['cookies']:
-        #     cookie_list = json.loads(self.info_dict['cookies'])
-        #     for cookie in cookie_list:
-        #         self.driver.add_cookie(cookie)
+        if self.was_used and self.info_dict['cookies']:
+            cookie_list = json.loads(self.info_dict['cookies'])
+            for cookie in cookie_list:
+                try:
+                    self.driver.add_cookie(cookie)
+                except:
+                    with self.lock:
+                        self.logger.warning(f"Failed import cookie for domain: {cookie['domain']}")
+                    pass
+                time.sleep(.1)
         self.default_window_handle = self.driver.current_window_handle
         if self.was_used:
             self.session_id = self.info_dict['session_id']
@@ -419,7 +484,7 @@ class TrafficBotProcess(Process):
 
             time.sleep(sec.randint(5, 40))
             self.per_impression_chance_to_click_banner()
-            if self.website_settings[self.site]['ad_clicks_enabled'] and self.clicks_ad:
+            if self.click_ad_allowed and self.clicks_ad:
                 self.click_rnd_banner_or_not()
 
     def delete_target_attributes(self):
@@ -481,14 +546,14 @@ class TrafficBotProcess(Process):
         if (500 - data * 100 / 2) < sec.randint(0, 1000) < (500 + data * 100 / 2):
             self.clicks_ad = True
         with self.lock:
-            self.logger.info(f"Clicks ad banner (Chance: 0.5%): {self.clicks_ad}")
+            self.logger.info(f"Clicks ad banner: {self.clicks_ad}")
 
     def click_rnd_banner_or_not(self):
         possibles = self.find_possible_banners()
         if isinstance(possibles, list):
             banner = sec.choice(possibles)
             with self.lock:
-                self.logger.info(f"CLICKING ON BANNER!")
+                self.logger.warning(f"CLICKING ON BANNER!")
             if self.ip_address_has_changed():
                 return None
             while self.clicked_ad == 0:
@@ -674,59 +739,126 @@ class TrafficBotInstance(Process):
     def __init__(self, _id, pipe_end, _logger, stdout_lock):
 
         Process.__init__(self)
-        self.name = f"Process0{_id}"
+        self.name = f"Instance{self.id}"
         self.id = _id
         self.dpp_id = f'P{self.id}'
-        self.com_chan = pipe_end
+        self.com_chan_parent = pipe_end
+        self.com_chan_child = None
         self.logger = _logger.getChild(self.name)
+        self.logger.setLevel(logging.DEBUG)
         self.lock = stdout_lock
         self.database_connection = None
         self.last_time_alive = None
+        self.instance = None
+        self.com_queue = []
 
     def run(self) -> None:
-        self.logger.debug('Creating database connection...')
-        self.database_connection = create_connection_pool(self.id + 1)
+        with self.lock:
+            self.logger.info('Starting TrafficBotInstance')
+            self.logger.debug('Creating database connection...')
+
+        # Create MariaDB connection pool
+        self.database_connection = create_connection_pool(str(int(self.id) + 1))
+
+        # Start main loop in TrafficBotInstance
         while True:
+            self.lock.acquire()
+            self.logger.info('Starting new main loop iteration.')
+            self.lock.release()
+            # Reset instance and timestamp-log on loop beginning
+            self.instance = None
             self.last_time_alive = None
 
+            self.lock.acquire()
+            self.logger.debug("Create multiprocessing pipe for bot initialization.")
+            self.lock.release()
+
+            self.com_chan_child, com_chan = Pipe()
             # Create new TrafficBotProcess and start it
-            process = TrafficBotProcess(
+            self.instance = TrafficBotProcess(
                 bid=self.id,
                 database_connection=self.database_connection,
-                communication_channel=self.com_chan,
+                communication_channel=com_chan,
                 lock_obj=self.lock,
                 log=self.logger
             )
-            process.start()
-            self.logger.debug('TrafficBotInstance started...')
 
-            self.last_time_alive = time.time()
-            loop_lock = True
-            while loop_lock:
-                time.sleep(60)
-                self.com_chan.send(DPP(self.dpp_id, '0', 'LOG', time.time()))
-                if self.com_chan.poll():
-                    dpp = self.com_chan.recv()
-                    if (dpp.TYPE == 'END') and (dpp.FROM == f'P{self.id}'):
-                        if process.is_alive():
-                            process.terminate()
-                        loop_lock = False
-                    elif (dpp.TYPE == 'END') and (dpp.FROM == '0'):
-                        if process.is_alive():
-                            process.terminate()
-                            self.terminate()
-            process.join()
+            if not self.instance:
+                self.lock.acquire()
+                self.logger.debug("Failed spawning TrafficBotProcess, retrying after timeout.")
+                self.lock.release()
+                time.sleep(25)
+                continue
+
+            while True:
+                if not self.instance.is_alive():
+                    self.instance.start()
+                    self.last_time_alive = time.time()
+                    self.com_chan_parent.send(DPP(self.dpp_id, '0', 'LOG', time.time()))
+
+                # Check for full pipes
+                if self.com_chan_child.poll():
+                    self.com_queue.append(self.com_chan_child.recv())
+                if self.com_chan_parent.poll():
+                    self.com_queue.append(self.com_chan_parent.recv())
+
+                # Check job queue
+                if self.com_queue:
+                    unlocked = self.handle_communication_packages()
+                    if unlocked:
+                        break
+                time.sleep(.61)
+
+    def handle_timeouts(self):
+        pass
+
+    def handle_communication_packages(self):
+        while len(self.com_queue) > 0:
+            # Pop job from com_queue
+            dpp = self.com_queue.pop(0)
+
+            # Forward if necessary
+            if dpp.TO != self.dpp_id:
+                self.lock.acquire()
+                self.logger.debug(f"Forwarding pipe packages")
+                self.lock.release()
+                if (dpp.FROM == '0') and (dpp.TYPE == 'PXY'):
+                    self.com_chan_child.send(dpp)
+                elif (dpp.FROM[0] == 'B') and (dpp.TYPE == 'PXY'):
+                    self.com_chan_parent.send(dpp)
+                else:
+                    self.logger.debug(f"Unknown transmitter in Package")
+
+            elif (dpp.TO == self.dpp_id) and (dpp.TYPE == "LOG"):
+                self.last_time_alive = dpp.DATA if dpp.DATA else time.time()
+            elif (dpp.TO == self.dpp_id) and (dpp.TYPE == "END"):
+                return True
+            else:
+                self.logger.debug(f"Unknown TYPE in Package")
+        return False
 
 
-class TrafficBotProcessManager:
-    """Communication between processes using the DAEN protocol"""
+class TrafficBotInstanceManager:
+    """
+    Top Level TrafficBot class.
+
+    For synchronization and communication between TrafficBotProcessManager (tb-manager)
+     and daemon processes, called TrafficBotInstances (tb-instance).
+     Synchronisation and communication is realized through duplex
+     communication channels (pipes) and a multiprocessing Lock object
+     instantiated in tb-manager, that is initialized in every tb-instance,
+     to sync logging to stdout.
+
+
+
+    """
 
     def __init__(self, instances_count):
         self._stdout_lock = Lock()
         self.dpp_id = '0'
         self.start_time = None
         self.logger = logging.getLogger('TrafficManager')
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(logging.DEBUG)
         self.ic = instances_count
         self.instances = {f'{r}': None for r in range(1, self.ic + 1)}
         self.com_chan = {f'{r}': Pipe() for r in range(1, self.ic + 1)}
@@ -755,7 +887,7 @@ class TrafficBotProcessManager:
         self.instances[str(x)].start()
 
     def handle_communication_packages(self):
-        while self.com_q:
+        while len(self.com_q) > 0:
             # Get job
             dpp = self.com_q.pop(0)
 
@@ -763,25 +895,21 @@ class TrafficBotProcessManager:
             if dpp.TO != self.dpp_id:
                 self.logger.debug("Forwarding pipe output to receiver")
                 self.com_chan[dpp.TO[1]].send(dpp)
-                continue
 
             # Process addressed to own address
             if self.dpp_id == dpp.TO:
                 if dpp.TYPE == "LOG":
-                    self.logger.debug("Processing LOG Packages...")
                     if isinstance(dpp.DATA, float):
-                        self.monitoring[dpp.FROM_id]["ts"] = dpp.DATA
+                        self.monitoring[dpp.FROM[-1]]["ts"] = dpp.DATA
                     elif isinstance(dpp.DATA, str):
-                        self.monitoring[dpp.FROM_id]["pxy"] = dpp.DATA
+                        self.monitoring[dpp.FROM[-1]]["pxy"] = dpp.DATA
                 elif dpp.TYPE == "PXY":
-                    self.logger.debug("Processing PXY Packages...")
                     if not dpp.DATA:
-                        self._send_proxy(dpp.FROM_id)
+                        self._send_proxy(dpp.FROM[-1])
                     elif isinstance(dpp.DATA, str):
                         self._add_proxy(dpp.DATA)
                 else:
                     self.logger.debug("Unknown TYPE in Package...")
-                continue
 
     def handle_timeouts(self):
         for x in self.monitoring:
@@ -789,11 +917,11 @@ class TrafficBotProcessManager:
                 self.logger.debug("Found unresponsive process...")
                 if self.instances[x].is_alive():
                     self.instances[x].terminate()
-
+                self.com_chan[x], com_chan = Pipe()
                 self.instances[x] = TrafficBotInstance(
                     _id=x,
                     _logger=self.logger,
-                    pipe_end=self.com_chan[x][1],
+                    pipe_end=com_chan,
                     stdout_lock=self._stdout_lock
                 )
                 self.instances[x].start()
@@ -824,7 +952,7 @@ class TrafficBotProcessManager:
 
 if __name__ == '__main__':
     try:
-        manager = TrafficBotProcessManager(6)
+        manager = TrafficBotInstanceManager(4)
         manager.run()
     except KeyboardInterrupt:
         pass
