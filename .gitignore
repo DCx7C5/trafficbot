@@ -1,9 +1,9 @@
 # Folders to ignore
 .idea/
-/firefox/
+/firefox/binary/
+/firefox/profile/
 
 # Files to ignore
-firefox.tar.gz
 geckodriver.log
 .lock
 .lock2

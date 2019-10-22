@@ -2,48 +2,59 @@ import os
 import sys
 import time
 import json
+import pickle
 import logging
 import requests
 import coloredlogs
-from multiprocessing import Process, Queue, Pipe, Lock
+import threading
+import multiprocessing as mp
 from socks import ProxyError
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
-
-from selenium.common.exceptions import WebDriverException, ElementNotInteractableException, JavascriptException
-from selenium.webdriver import FirefoxProfile
 from secrets import SystemRandom
-
+from pyvirtualdisplay import Display
 from selenium.webdriver import Firefox
-from selenium.webdriver.support.wait import WebDriverWait
-from urllib3.exceptions import InsecureRequestWarning
+from libtrafficbot.blocked import BLOCKED
 from user_agent import generate_user_agent
+from selenium.webdriver.common.by import By
+from selenium.webdriver import FirefoxProfile
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.remote.remote_connection import LOGGER
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (WebDriverException, ElementNotInteractableException,
+                                        JavascriptException, NoSuchElementException, ElementClickInterceptedException)
+from urllib3.exceptions import InsecureRequestWarning
 
-from blocked import BLOCKED
-from traffic_sql import get_website_settings_sql, update_bot_sessions_finish_sql, \
-    update_bot_sessions_start_sql, get_referrer_links_sql, get_website_locators_sql, create_connection_pool, \
-    proxy_ext_ip_was_used, get_geoip_info_sql
-
-
-
+from libtrafficbot.bot_helper import calculate_chance_weight_based, choose_fair, is_xpath_locator
+from libtrafficbot.sql import database_connection_pool as db_pool
+from libtrafficbot.sql.sql_funcs import (get_website_settings_sql, update_bot_sessions_finish_sql,
+                                         update_bot_sessions_start_sql, get_referrer_links_sql,
+                                         get_website_locators_sql, proxy_ext_ip_was_used, get_geoip_info_sql)
 
 sec = SystemRandom()
 
 LOGGER.setLevel(logging.WARNING)
 CWD = os.getcwd()
-pq = Queue()
 
 logger = logging.getLogger('TRAFFICBOT')
-urlliblog = logging.getLogger('urllib3')
-sockslog = logging.getLogger('socks')
-sockslog.setLevel(logging.WARNING)
-urlliblog.setLevel(logging.CRITICAL)
+
+u_log = logging.getLogger('urllib3')
+u_log.setLevel(logging.CRITICAL)
+
+s_log = logging.getLogger('socks')
+s_log.setLevel(logging.WARNING)
+
+e_log = logging.getLogger('easyprocess')
+e_log.setLevel(logging.WARNING)
+
+p_log = logging.getLogger('pyvirtualdisplay')
+p_log.setLevel(logging.CRITICAL)
+
 coloredlogs.install(
-    level=logging.INFO,
+    level=logging.DEBUG,
     fmt=f'%(asctime)-20s- %(name)-31s - %(process)-6s- %(levelname)-7s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
 
 PROXIES = [
     "https://190.2.153.131:38239",
@@ -59,87 +70,29 @@ PROXIES = [
 ]
 sec.shuffle(PROXIES)
 
-
-def is_xpath_locator(locator_string: str) -> bool:
-    """
-    Checks if locator string is XPath Element
-    """
-    if locator_string.startswith("/"):
-        return True
-    return False
+proxy_queue = mp.Manager().Queue()
 
 
-def calculate_chance_weight_based(data: [tuple]):
-    result = []
-    for x in data:
-        for r in range(int(x[1] * 100)):
-            result.append(x[0])
-    return sec.choice(result)
+class TrafficBot(mp.Process):
 
-
-def calculate_bool_percentage_based(data: float or int) -> bool:
-    if (500 - data * 10 / 2) < sec.randint(0, 1000) < (500 + data * 10 / 2):
-        return True
-    return False
-
-
-def calculate_chance_percentage_based(data) -> bool:
-    result = []
-    for x in data:
-        for r in range(int(x[1] * 10)):
-            result.append(x[0])
-    return sec.choice(result)
-
-
-def choose_fair(data):
-    if isinstance(data, float) or isinstance(data, int):
-        return calculate_bool_percentage_based(data)
-    elif (isinstance(data, tuple) or isinstance(data, list)) and (isinstance(data[0], tuple) or isinstance(data[0], list)):
-        return calculate_chance_weight_based(data)
-    elif (isinstance(data, tuple) or isinstance(data, list)) and (not (isinstance(data[0], tuple) or isinstance(data[0], list))):
-        return sec.choice(data)
-    elif isinstance(data, str) and isinstance(float(data), float):
-        return calculate_bool_percentage_based(data)
-
-
-class DPP:
-    """Daen Protocol Package"""
-    def __init__(self, t: str, r: str, ty: str, data):
-        self.FROM = t
-        self.FROM_id_numeric = int(t[-1])
-        self.TO = r
-        self.TO_id_numeric = int(r[-1])
-        self.TYPE = ty
-        self.DATA = data
-
-
-class TrafficBotProcess(Process):
-
-    def __init__(self, bid: int, database_connection, communication_channel, log, lock_obj, headless=True):
-        Process.__init__(self)
+    def __init__(self, bid: int, database_connection, proxy, log, lock_obj, headless=False):
+        mp.Process.__init__(self)
         self.id = bid
         self.name = 'Bot'
+        self.headless_firefox = headless
         self.logger = log.getChild(self.name)
         self.lock = lock_obj
-        self.dpp_id = f'B{self.id}'
-        self.com_chan = communication_channel
         self.db_conn = database_connection
         # Randomly choose site for this Process
         self.website_settings = get_website_settings_sql(self.db_conn)
         self.site = calculate_chance_weight_based(
             [(s, self.website_settings[s]["global_site_weight"]) for s in self.website_settings]
         )
-        with self.lock:
-            self.logger.info(self.site)
-
         self.clicks_ad = False
         self.clicked_ad = 0
         self.click_ad_allowed = self.website_settings[self.site]["ad_clicks_enabled"]
 
-        if headless is True:
-            os.environ['MOZ_HEADLESS'] = '1'
-
-        self.proxy = None
+        self.proxy = proxy
         self.proxy_ip = None
         self.proxy_port = None
         self.active_ext_ip = None
@@ -148,8 +101,8 @@ class TrafficBotProcess(Process):
         self.active_country = None
         self.active_language = None
         self.active_google_domain = None
-        self.active_ua = generate_user_agent(device_type='desktop')
-        self.is_mobile = False
+        self.active_ua = None
+        self.is_mobile = None
         self.error_counter = None
         self.rotation_time = None
         self.install_alexa_toolbar = None
@@ -159,49 +112,67 @@ class TrafficBotProcess(Process):
         self.first_inited = None
         self.session_created = None
         self.default_window_handle = None
+        self.screen_x = None
+        self.screen_y = None
+        self.pickled_profile = None
+        self.xvfb = None
+
+    def create_display(self):
+        try:
+            # Emulating headless window manager to run Firefox in non headless mode
+            size = sec.choice(
+                [(1920, 1080) for _ in range(100)] +
+                [(1280, 720) for _ in range(20)] +
+                [(4096, 2160) for _ in range(20)] if (self.is_mobile is False) else []
+            )
+            return Display(visible=False, size=(size[0], size[1]), use_xauth=True).start()
+        except:
+            pass
+        with self.lock:
+            self.logger.warning("Failed instantiating virtual display manager. Fallback to headless Firefox")
+        self.headless_firefox = True
+        os.environ['MOZ_HEADLESS'] = '1'
+
+        return None
 
     def run(self) -> None:
+        self.error_counter = 0
         try:
-            while not self.first_inited:
+            while True:
+                if self.error_counter > 3:
+                    raise Exception('Error during process initialization!')
+
                 self.first_init()
-            while not self.session_created:
+                if not self.first_inited:
+                    self.error_counter += 1
+                    continue
+
                 self.create_session()
+                if not self.session_created:
+                    self.error_counter += 1
+                    continue
+
+                if self.first_inited and self.session_created:
+                    break
+
+            WebDriverWait(self.driver, sec.randint(500, 3000) / 1000)
             self.ref()
-            time.sleep(sec.randint(2, 8))
+
+            WebDriverWait(self.driver, sec.randint(500, 8000) / 1000)
             self.handle_onsite()
-        except ProxyError as pe:
-            with self.lock:
-                self.logger.error(str(pe))
-        except Exception as ex:
-            with self.lock:
-                self.logger.error(str(ex))
-        finally:
+
+            WebDriverWait(self.driver, sec.randint(500, 8000) / 1000)
             self.save_session()
-            self.lock.acquire()
-            self.logger.debug('Session saved to database...')
-            self.lock.release()
             self.close_and_quit()
-            self.lock.acquire()
-            self.logger.debug('Driver session closed and cleaned up...')
-            self.logger.debug('Sending PXY Package to manager...')
-            self.lock.release()
-            self.com_chan.send(DPP(self.dpp_id, '0', 'PXY', self.proxy))
-            self.lock.acquire()
-            self.logger.debug('Sending END Package to instance, waiting for response...')
-            self.lock.release()
-            self.com_chan.send(DPP(self.dpp_id, f'P{self.id}', 'END', True))
-            if self.com_chan.recv().DATA:
-                self.lock.acquire()
-                self.logger.debug('...received response, process stopping...')
-                self.lock.release()
+
+            with self.lock:
+                self.logger.debug('Session saved to database...')
+        except ProxyError as pe:
+            if not self.ip_address_has_changed():
+                with self.lock:
+                    self.logger.error("ProxyError" + pe.msg)
 
     def first_init(self):
-        with self.lock:
-            self.logger.debug("Requesting new proxy from TrafficBotManager")
-        self.com_chan.send(DPP(self.dpp_id, '0', 'PXY', None))
-        self.proxy = self.com_chan.recv().DATA
-        with self.lock:
-            self.logger.debug(f"Received proxy from TrafficBotManager: {self.proxy}")
         self.proxy_ip = self.proxy.split('//')[1].split(':')[0]
         self.proxy_port = int(self.proxy.split('//')[1].split(':')[1])
 
@@ -230,10 +201,6 @@ class TrafficBotProcess(Process):
 
         self.error_counter = 0
 
-        self.rotation_time = 300
-        time.sleep(sec.randint(500, 3000) / 1000)
-        # Create browser session
-
         self.ref_id, self.ref = choose_fair(
             [
                 ((1, self.handle_google_ref), self.website_settings[self.site]['percent_google_refs']),
@@ -251,7 +218,7 @@ class TrafficBotProcess(Process):
 
         with self.lock:
             if self.was_used:
-                self.logger.warning(f"Same external IP used in last 10 minutes: {self.proxy}")
+                self.logger.warning(f"Same external IP used in last 10 minutes: {self.active_ext_ip}")
             self.logger.debug(f"Fetched IP geolocation and meta data via {'database.' if self.was_used else 'HTTP request.'}")
             self.logger.debug(f"Socks5 proxy URL   : {self.proxy}")
             self.logger.debug(f"External IP address: {self.active_ext_ip}")
@@ -260,7 +227,7 @@ class TrafficBotProcess(Process):
             self.logger.debug(f"Google domain      ; {self.active_google_domain}")
             self.logger.debug(f"User agent         : {self.active_ua}")
             self.logger.debug(f"Is mobile device   : {self.is_mobile}")
-            self.logger.debug(f'Session website    ; {self.site}')
+            self.logger.info(f'Session website    : {self.site}')
             self.logger.debug(f'Session refsite    : {self.ref_id}')
             self.logger.debug(f'Alexa toolbar      : {"Yes" if self.install_alexa_toolbar else "No"}')
             self.logger.debug(f'Ad click allowed   : {"Yes" if self.click_ad_allowed else "No"}')
@@ -283,11 +250,16 @@ class TrafficBotProcess(Process):
         profile.update_preferences()
         # Gecko driver log level
 
+        self.pickled_profile = pickle.dumps(profile)
+
+        self.xvfb = self.create_display()
+
         self.driver = Firefox(
             executable_path=f"{CWD}/firefox/driver/geckodriver",
             firefox_binary=f"{CWD}/firefox/binary/firefox-bin",
             firefox_profile=profile,
         )
+        self.driver.set_page_load_timeout(125)
         if self.was_used and self.info_dict['cookies']:
             cookie_list = json.loads(self.info_dict['cookies'])
             for cookie in cookie_list:
@@ -301,8 +273,6 @@ class TrafficBotProcess(Process):
         self.default_window_handle = self.driver.current_window_handle
         if self.was_used:
             self.session_id = self.info_dict['session_id']
-            with self.lock:
-                self.logger.info('Session was used before')
         else:
             self.session_id = update_bot_sessions_start_sql(
                 pool=self.db_conn,
@@ -322,18 +292,20 @@ class TrafficBotProcess(Process):
         self.driver.maximize_window()
         if isinstance(self.driver, Firefox):
             self.session_created = True
-        else:
-            time.sleep(8)
 
     def save_session(self):
-        cookies = self.driver.get_cookies()
-        json_cookies = json.dumps(cookies)
-        update_bot_sessions_finish_sql(
-            pool=self.db_conn,
-            cookies=json_cookies,
-            clicked_banner=self.clicked_ad,
-            last_inserted_id=self.session_id
-        )
+        try:
+            if self.driver:
+                cookies = self.driver.get_cookies()
+                json_cookies = json.dumps(cookies)
+                update_bot_sessions_finish_sql(
+                    pool=self.db_conn,
+                    cookies=json_cookies,
+                    clicked_banner=self.clicked_ad,
+                    last_inserted_id=self.session_id
+                )
+        except:
+            pass
 
     def handle_bitcoin_talk_ref(self):
         site_and_locator = sec.choice(get_referrer_links_sql(
@@ -366,49 +338,69 @@ class TrafficBotProcess(Process):
         )
         site = site_and_exit[0]
         locator = site_and_exit[1]
-        alt_locator = site_and_exit[2]
         with self.lock:
             self.logger.info(f"GET {site_and_exit[0]}")
         try:
             self.driver.get(site)
         except WebDriverException as we:
-            if "about:neterror?" in str(we):
-                time.sleep(sec.randint(2, 5))
-                self.driver.refresh()
-            self.driver.get(site.replace(self.active_google_domain, "https://google.com"))
+            if self.ip_address_has_changed():
+                return False
+            WebDriverWait(self.driver, sec.randint(500, 3000) / 1000)
+            if ("about:neterror?" or "document.body is null") in str(we):
+                self.driver.get(site.replace(self.active_google_domain, "https://google.com"))
+            else:
+                self.handle_twitter_ref()
+
+        if self.ip_address_has_changed():
+            return False
+
         if ("Error 404" or "Problem loading page") in self.driver.title:
-            self.driver.get(site.replace(self.active_google_domain, "https://google.com"))
+            WebDriverWait(self.driver, sec.randint(2000, 5000) / 1000)
+            try:
+                self.driver.get(site.replace(self.active_google_domain, "https://google.com"))
+            except Exception as e:
+                self.logger.error(e)
+
         if ("502" or "Gateway") in self.driver.title:
-            time.sleep(7)
+            WebDriverWait(self.driver, sec.randint(2000, 5000) / 1000)
             self.driver.refresh()
+
         if "sorry" in self.driver.current_url:
             self.driver.get(site.replace(self.active_google_domain, "https://google.com"))
+
         if "captcha" in self.driver.find_element_by_tag_name("body").text:
             self.handle_twitter_ref()
-        elements = None
+
+        elem = None
         self.delete_target_attributes()
         if is_xpath_locator(locator):
             elem = self.driver.find_element_by_xpath(locator)
         else:
             elements = self.driver.find_elements_by_css_selector(locator)
             if not elements:
-                elements = self.driver.find_element_by_css_selector(alt_locator)
-            elem = sec.choice(elements)
+                self.handle_twitter_ref()
+            try:
+                elem = sec.choice(elements)
+            except IndexError:
+                self.handle_twitter_ref()
+
         try:
             elem.click()
-        except ElementNotInteractableException:
-            elements.remove(elem)
-            elem = sec.choice(elements)
-            elem.click()
+        except AttributeError:
+            self.run()
         except WebDriverException as we:
+            if self.ip_address_has_changed():
+                return False
             if "about:neterror?" in str(we):
-                time.sleep(sec.randint(2000, 5000) / 1000)
+                WebDriverWait(self.driver, sec.randint(2000, 5000) / 1000)
                 self.driver.refresh()
+        if self.ip_address_has_changed():
+            return False
         if ("Error 404" or "Problem loading page") in self.driver.title:
-            time.sleep(sec.randint(100, 5000) / 1000)
+            WebDriverWait(self.driver, sec.randint(2000, 5000) / 1000)
             self.driver.refresh()
         if ("Error 502" or "Gateway") in self.driver.title:
-            time.sleep(sec.randint(100, 5000) / 1000)
+            WebDriverWait(self.driver, sec.randint(2000, 5000) / 1000)
             self.driver.refresh()
 
     def handle_twitter_ref(self):
@@ -430,7 +422,7 @@ class TrafficBotProcess(Process):
 
             # Wait 40 secs until all elements of type locator are located, then proceed
             WebDriverWait(self.driver, 33).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, locator)))
-            time.sleep(sec.randint(1, 3))
+            WebDriverWait(self.driver, sec.randint(500, 5000) / 1000)
 
             # Check for shitty random appearing overlay
             elements = self.driver.find_elements_by_xpath(
@@ -441,7 +433,7 @@ class TrafficBotProcess(Process):
                     self.logger.warning("Found shitty popup on twitter")
                 elem = elements[0]
                 elem.click()
-            time.sleep(sec.randint(1, 3))
+            WebDriverWait(self.driver, sec.randint(1000, 5000) / 1000)
             self.delete_target_attributes()
             if is_xpath_locator(locator):
                 elem = self.driver.find_element_by_xpath(locator)
@@ -450,22 +442,26 @@ class TrafficBotProcess(Process):
             with self.lock:
                 self.logger.info(f"Clicking on reflink: {elem.text}")
             elem.click()
-            time.sleep(sec.randint(5, 20))
+            WebDriverWait(self.driver, sec.randint(5000, 20000) / 1000)
             if "t.co" in self.driver.current_url:
                 with self.lock:
                     self.logger.info(f"Site loading error, repeating request")
 
-                time.sleep(sec.randint(2, 5))
-                self.driver.get(self.driver.current_url)
+                WebDriverWait(self.driver, sec.randint(1000, 5000) / 1000)
+                self.driver.refresh()
         except WebDriverException as we:
+            if self.ip_address_has_changed():
+                return False
             if "about:neterror?" in str(we):
-                time.sleep(sec.randint(2, 5))
+                WebDriverWait(self.driver, sec.randint(1000, 5000) / 1000)
                 self.driver.refresh()
 
     def handle_onsite(self):
+        """Routine for handling one of the main websites"""
         while True:
+
             if self.ip_address_has_changed():
-                return None
+                return False
             time.sleep(sec.randint(1, 8))
             self.scroll_window()
             loc = sec.choice(
@@ -474,15 +470,28 @@ class TrafficBotProcess(Process):
                     website=self.site
                 )
             )
+            elem = None
             if is_xpath_locator(loc):
-                elem = self.driver.find_element_by_xpath(loc)
+                try:
+                    elem = self.driver.find_element_by_xpath(loc)
+                except NoSuchElementException:
+                    pass
             else:
-                elem = self.driver.find_element_by_css_selector(loc)
+                try:
+                    elem = self.driver.find_element_by_css_selector(loc)
+                except NoSuchElementException:
+                    elem = WebDriverWait(self.driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, loc)))
+            if not isinstance(elem, WebElement):
+                return False
             with self.lock:
                 self.logger.info(f"Clicking on site element: {elem.text}")
-            elem.click()
-
-            time.sleep(sec.randint(5, 40))
+            try:
+                elem.click()
+            except ElementClickInterceptedException:
+                self.run()
+            except WebDriverException:
+                self.close_and_quit()
+            WebDriverWait(self.driver, sec.randint(1200, 55000) / 1000)
             self.per_impression_chance_to_click_banner()
             if self.click_ad_allowed and self.clicks_ad:
                 self.click_rnd_banner_or_not()
@@ -502,24 +511,37 @@ class TrafficBotProcess(Process):
             "var c=document.getElementsByTagName('a');for(var i=0;i<c.length;i++){c[i].removeAttribute('rel');}"
         )
 
-    def scroll_window(self):
+    def scroll_window(self, coordinates: tuple = None):
         try:
-            percentage_from_screen = sec.randint(15, 80)
-            self.driver.execute_script(
-                f"var h=document.body.scrollHeight;window.scrollTo(0,h*{percentage_from_screen}/100);"
-            )
-            time.sleep(sec.randint(0, 3333) / 1000)
-            self.driver.execute_script("window.scrollTo(0,0);")
-        except JavascriptException as je:
-            pass
+            if not coordinates:
+                percentage_from_screen = sec.randint(15, 80)
+                self.driver.execute_script(
+                    f"var h=document.body.scrollHeight;window.scrollTo(0,h*{percentage_from_screen}/100);"
+                )
+                time.sleep(sec.randint(0, 3333) / 1000)
+                self.driver.execute_script("window.scrollTo(0,0);")
+            else:
+                x = str(coordinates[0])
+                y = str(coordinates[1])
+                self.driver.execute_script(
+                    f"var h=document.body.scrollHeight;window.scrollTo({x},{y});"
+                )
+        except JavascriptException as jse:
+            with self.lock:
+                self.logger.error(jse)
 
     def ip_address_has_changed(self):
-        _proxy = {'http': f'socks5://{self.proxy_ip}:{self.proxy_port}',
-                  'https': f'socks5://{self.proxy_ip}:{self.proxy_port}'}
+        _proxy = {
+            'http': f'socks5://{self.proxy_ip}:{self.proxy_port}',
+            'https': f'socks5://{self.proxy_ip}:{self.proxy_port}'
+        }
         ext_ip = None
         while ext_ip is None:
             try:
-                ext_ip = requests.get('https://coinminingpool.org/api/ip', proxies=_proxy).text[1:]
+                ext_ip = requests.get(
+                    url='https://coinminingpool.org/api/ip',
+                    proxies=_proxy
+                ).text[1:]
             except Exception:
                 time.sleep(sec.randint(1111, 2111) / 1000)
                 pass
@@ -545,8 +567,6 @@ class TrafficBotProcess(Process):
         data = self.website_settings[self.site]['percent_ctr']
         if (500 - data * 100 / 2) < sec.randint(0, 1000) < (500 + data * 100 / 2):
             self.clicks_ad = True
-        with self.lock:
-            self.logger.info(f"Clicks ad banner: {self.clicks_ad}")
 
     def click_rnd_banner_or_not(self):
         possibles = self.find_possible_banners()
@@ -564,19 +584,19 @@ class TrafficBotProcess(Process):
                 except ElementNotInteractableException:
                     possibles.remove(banner)
                     banner = sec.choice(possibles)
-                    time.sleep(sec.randint(2000, 3333) / 1000)
+                    WebDriverWait(self.driver, sec.randint(1000, 5000) / 1000)
             open_windows = self.driver.window_handles
             if len(open_windows) > 1:
                 open_windows.remove(self.default_window_handle)
                 for win in open_windows:
                     self.driver.switch_to.window(win)
-                    time.sleep(sec.randint(2000, 3333) / 1000)
+                    WebDriverWait(self.driver, sec.randint(1000, 5000) / 1000)
                     self.scroll_window()
                     try:
                         self.driver.find_element_by_tag_name('body').click()
                     except:
                         pass
-                    time.sleep(sec.randint(2000, 13333) / 1000)
+                    WebDriverWait(self.driver, sec.randint(1000, 5000) / 1000)
                     self.driver.close()
             self.driver.switch_to.window(self.default_window_handle)
 
@@ -646,7 +666,15 @@ class TrafficBotProcess(Process):
 
     def banner_is_present_728x90_coinzilla(self):
         """Checks if 728x90 banner is displayed and returns the iframe object if true"""
-        banner = self.driver.find_elements_by_id("Z-5185cbd4f18e967f55")
+        banner = None
+        try:
+            banner = self.driver.find_elements_by_id("Z-5185cbd4f18e967f55")
+        except Exception as e:
+            if "not clickable at point" in str(e):
+                x = str(e).split("point (")[1].split(",")[0]
+                y = str(e).split(") because")[0].split(",")[-1]
+                self.scroll_window(coordinates=(x, y))
+                banner = self.driver.find_elements_by_id("Z-5185cbd4f18e967f55")
         if not banner:
             return False
         self.driver.switch_to.frame(banner[0])
@@ -727,115 +755,106 @@ class TrafficBotProcess(Process):
     def close_and_quit(self):
         with self.lock:
             self.logger.warning(f'Closing!')
-        time.sleep(sec.randint(0, 3333) / 1000)
         if isinstance(self.driver, Firefox) and (len(self.driver.window_handles) > 1):
             self.driver.close()
         if isinstance(self.driver, Firefox):
             self.driver.quit()
+        if isinstance(self.xvfb, Display):
+            self.xvfb.stop()
 
 
-class TrafficBotInstance(Process):
+class TrafficBotMonitorDaemon(threading.Thread):
+    """
+    Daemon thread to manage TrafficBotProcesses
+    """
 
-    def __init__(self, _id, pipe_end, _logger, stdout_lock):
+    def __init__(self, d_id, d_logger, stdout_lock, db_conn, user_stop_event=None):
 
-        Process.__init__(self)
-        self.name = f"Instance{self.id}"
-        self.id = _id
-        self.dpp_id = f'P{self.id}'
-        self.com_chan_parent = pipe_end
-        self.com_chan_child = None
-        self.logger = _logger.getChild(self.name)
+        threading.Thread.__init__(self)
+        self.id = d_id
+        self.name = f"Daemon{self.id}"
+        self.daemon = True
+        self.logger = d_logger.getChild(self.name)
         self.logger.setLevel(logging.DEBUG)
         self.lock = stdout_lock
-        self.database_connection = None
-        self.last_time_alive = None
-        self.instance = None
-        self.com_queue = []
+        self.database_connection = db_conn
+        self.last_time_alive = time.time()
+        self.proc_first_time_alive = None
+        self.stop_daemon_event = threading.Event()
+        self.child_process = None
+        self.active_proxy = None
+        self.user_stop_event = user_stop_event or threading.Event()
 
     def run(self) -> None:
         with self.lock:
-            self.logger.info('Starting TrafficBotInstance')
-            self.logger.debug('Creating database connection...')
-
-        # Create MariaDB connection pool
-        self.database_connection = create_connection_pool(str(int(self.id) + 1))
+            self.logger.debug(f'Starting Daemon {self.id}')
 
         # Start main loop in TrafficBotInstance
         while True:
-            self.lock.acquire()
-            self.logger.info('Starting new main loop iteration.')
-            self.lock.release()
-            # Reset instance and timestamp-log on loop beginning
-            self.instance = None
-            self.last_time_alive = None
 
-            self.lock.acquire()
-            self.logger.debug("Create multiprocessing pipe for bot initialization.")
-            self.lock.release()
+            # If is None start
+            if not self.child_process:
+                self.start_process()
 
-            self.com_chan_child, com_chan = Pipe()
-            # Create new TrafficBotProcess and start it
-            self.instance = TrafficBotProcess(
-                bid=self.id,
-                database_connection=self.database_connection,
-                communication_channel=com_chan,
-                lock_obj=self.lock,
-                log=self.logger
-            )
+            # If process is dead check for KeyboardInterrupt or normal finish
+            elif isinstance(self.child_process, mp.Process) and (not self.child_process.is_alive()):
+                if self.stop_daemon_event.is_set():
+                    break
+                self.add_to_proxy_queue(self.active_proxy)
+                self.start_process()
 
-            if not self.instance:
-                self.lock.acquire()
-                self.logger.debug("Failed spawning TrafficBotProcess, retrying after timeout.")
-                self.lock.release()
-                time.sleep(25)
-                continue
+            # if alive check for possible timeout errors
+            elif isinstance(self.child_process, mp.Process) and self.child_process.is_alive():
+                if time.time() > self.proc_first_time_alive + 420:
+                    self.child_process.terminate()
+                    with self.lock:
+                        self.logger.critical("Found unresponsive Process...")
+                    self.stop_daemon_event.set()
 
-            while True:
-                if not self.instance.is_alive():
-                    self.instance.start()
-                    self.last_time_alive = time.time()
-                    self.com_chan_parent.send(DPP(self.dpp_id, '0', 'LOG', time.time()))
+            if time.time() > self.last_time_alive + 60:
+                self.last_time_alive = time.time()
 
-                # Check for full pipes
-                if self.com_chan_child.poll():
-                    self.com_queue.append(self.com_chan_child.recv())
-                if self.com_chan_parent.poll():
-                    self.com_queue.append(self.com_chan_parent.recv())
+            if self.stop_daemon_event.is_set():
+                break
 
-                # Check job queue
-                if self.com_queue:
-                    unlocked = self.handle_communication_packages()
-                    if unlocked:
-                        break
-                time.sleep(.61)
+            time.sleep(.25)
 
-    def handle_timeouts(self):
-        pass
+    def start_process(self):
+        with self.lock:
+            self.logger.debug('Creating new TrafficBot process.')
 
-    def handle_communication_packages(self):
-        while len(self.com_queue) > 0:
-            # Pop job from com_queue
-            dpp = self.com_queue.pop(0)
+        # Get proxy from queue
+        proxy = self.get_proxy_from_queue()
 
-            # Forward if necessary
-            if dpp.TO != self.dpp_id:
-                self.lock.acquire()
-                self.logger.debug(f"Forwarding pipe packages")
-                self.lock.release()
-                if (dpp.FROM == '0') and (dpp.TYPE == 'PXY'):
-                    self.com_chan_child.send(dpp)
-                elif (dpp.FROM[0] == 'B') and (dpp.TYPE == 'PXY'):
-                    self.com_chan_parent.send(dpp)
-                else:
-                    self.logger.debug(f"Unknown transmitter in Package")
+        # Create new TrafficBotProcess and start it
+        self.child_process = TrafficBot(
+            bid=self.id,
+            proxy=proxy,
+            database_connection=self.database_connection,
+            lock_obj=self.lock,
+            log=self.logger
+        )
+        self.child_process.start()
 
-            elif (dpp.TO == self.dpp_id) and (dpp.TYPE == "LOG"):
-                self.last_time_alive = dpp.DATA if dpp.DATA else time.time()
-            elif (dpp.TO == self.dpp_id) and (dpp.TYPE == "END"):
-                return True
-            else:
-                self.logger.debug(f"Unknown TYPE in Package")
-        return False
+        # Log timestamp
+        self.proc_first_time_alive = time.time()
+
+    def get_proxy_from_queue(self):
+        self.active_proxy = proxy_queue.get()
+        with self.lock:
+            self.logger.debug(f"Fetched from proxy_list: {self.active_proxy}")
+        return self.active_proxy
+
+    def add_to_proxy_queue(self, proxy):
+        proxy_queue.put(proxy)
+        with self.lock:
+            self.logger.debug(f"Added proxy to proxy_list: {proxy}")
+
+    def kill_daemon(self):
+        self.child_process.terminate()
+        self.stop_daemon_event.set()
+        self.logger.debug("TrafficBotInstance Stopped")
+        return True
 
 
 class TrafficBotInstanceManager:
@@ -843,118 +862,95 @@ class TrafficBotInstanceManager:
     Top Level TrafficBot class.
 
     For synchronization and communication between TrafficBotProcessManager (tb-manager)
-     and daemon processes, called TrafficBotInstances (tb-instance).
+     and daemon threads, called TrafficBotInstances (tb-instance).
      Synchronisation and communication is realized through duplex
      communication channels (pipes) and a multiprocessing Lock object
      instantiated in tb-manager, that is initialized in every tb-instance,
      to sync logging to stdout.
 
-
-
+    Parameter:
+        instances_count - Number of daemon processes to spawn
     """
 
     def __init__(self, instances_count):
-        self._stdout_lock = Lock()
-        self.dpp_id = '0'
-        self.start_time = None
+        self.ic = instances_count
         self.logger = logging.getLogger('TrafficManager')
         self.logger.setLevel(logging.DEBUG)
-        self.ic = instances_count
-        self.instances = {f'{r}': None for r in range(1, self.ic + 1)}
-        self.com_chan = {f'{r}': Pipe() for r in range(1, self.ic + 1)}
-        self.monitoring = {f'{r}': {'ts': None, "pxy": None} for r in range(1, self.ic + 1)}
-        self.com_q = []
-        self.proxy_list = PROXIES
+        self.lock = mp.Lock()
+        self.start_time = time.time()
+        self.daemons = {f'{r}': None for r in range(1, self.ic + 1)}
+        self.keep_alive_timestamps = {f'{r}': None for r in range(1, self.ic + 1)}
 
-    def _send_proxy(self, bot_id):
-        proxy = self.proxy_list.pop(0)
-        self.monitoring[bot_id]["ts"] = time.time()
-        self.monitoring[bot_id]["pxy"] = proxy
-        self.com_chan[bot_id].send(DPP('0', f'B{bot_id}', 'PXY', proxy))
+        self.proxy_blacklist = []
+        for PXY in PROXIES:
+            proxy_queue.put(PXY)
 
-    def _add_proxy(self, proxy):
-        self.proxy_list.append(proxy)
+        self.database_connection = db_pool(str(10))
 
-    def _start_instance(self, x):
-        self.instances[str(x)] = TrafficBotInstance(
-            _id=x,
-            _logger=self.logger,
-            pipe_end=self.com_chan[str(x)][1],
-            stdout_lock=self._stdout_lock
+    def start_daemon(self, x):
+        if isinstance(x, int):
+            x = str(x)
+        self.daemons[x] = TrafficBotMonitorDaemon(
+            d_id=x,
+            d_logger=self.logger,
+            stdout_lock=self.lock,
+            db_conn=self.database_connection
         )
-        self.com_chan[str(x)] = self.com_chan[str(x)][0]
-        self.monitoring[str(x)]["ts"] = time.time()
-        self.instances[str(x)].start()
+        self.daemons[x].start()
 
-    def handle_communication_packages(self):
-        while len(self.com_q) > 0:
-            # Get job
-            dpp = self.com_q.pop(0)
-
-            # Forward if necessary
-            if dpp.TO != self.dpp_id:
-                self.logger.debug("Forwarding pipe output to receiver")
-                self.com_chan[dpp.TO[1]].send(dpp)
-
-            # Process addressed to own address
-            if self.dpp_id == dpp.TO:
-                if dpp.TYPE == "LOG":
-                    if isinstance(dpp.DATA, float):
-                        self.monitoring[dpp.FROM[-1]]["ts"] = dpp.DATA
-                    elif isinstance(dpp.DATA, str):
-                        self.monitoring[dpp.FROM[-1]]["pxy"] = dpp.DATA
-                elif dpp.TYPE == "PXY":
-                    if not dpp.DATA:
-                        self._send_proxy(dpp.FROM[-1])
-                    elif isinstance(dpp.DATA, str):
-                        self._add_proxy(dpp.DATA)
-                else:
-                    self.logger.debug("Unknown TYPE in Package...")
-
-    def handle_timeouts(self):
-        for x in self.monitoring:
-            if self.monitoring[x]['ts'] and (time.time() > (self.monitoring[x]['ts'] + 450)):
-                self.logger.debug("Found unresponsive process...")
-                if self.instances[x].is_alive():
-                    self.instances[x].terminate()
-                self.com_chan[x], com_chan = Pipe()
-                self.instances[x] = TrafficBotInstance(
-                    _id=x,
-                    _logger=self.logger,
-                    pipe_end=com_chan,
-                    stdout_lock=self._stdout_lock
-                )
-                self.instances[x].start()
-                self.logger.debug("Rebooted the process...")
+    def handle_daemon_timeouts(self):
+        for x in self.daemons.keys():
+            if self.daemons[str(x)].last_time_alive and (time.time() > (self.daemons[str(x)].last_time_alive + 180)):
+                with self.lock:
+                    self.logger.critical(f"Found unresponsive daemon thread #{x}...")
+                time.sleep(5)
+                self.start_daemon(str(x))
+                with self.lock:
+                    self.logger.debug("Rebooted the daemon thread...")
+            if not self.daemons[str(x)].is_alive():
+                self.start_daemon(str(x))
+                with self.lock:
+                    self.logger.debug("Rebooted the daemon thread...")
 
     def run(self):
-        self.start_time = time.time()
-        self.logger.debug("STARTING BOT!")
-        # Start all instances
-        for x in range(1, self.ic + 1):
-            self._start_instance(x)
-            time.sleep(2.5)
+        ts = time.time()
+        self.logger.debug("STARTING TRAFFIC MANAGER!")
 
         while True:
-            # Listen for incoming packages
-            for i in self.com_chan:
-                if self.com_chan[i].poll():
-                    self.com_q.append(self.com_chan[i].recv())
 
-            # Process packages
-            if self.com_q:
-                self.handle_communication_packages()
+            for d in self.daemons.keys():
+                if not self.daemons[d]:
+                    self.start_daemon(d)
 
-            self.handle_timeouts()
+                elif isinstance(self.daemons[d], threading.Thread):
+                    if not self.daemons[d].is_alive():
+                        with self.lock:
+                            self.logger.critical(f"Found dead daemon thread #{d}...restarting")
+                        self.start_daemon(d)
+                    elif self.daemons[d].is_alive() and (time.time() > self.daemons[d].last_time_alive + 120):
+                        with self.lock:
+                            self.logger.critical(f"Found unresponsive daemon thread #{d}...restarting")
+                        self.start_daemon(d)
 
-            time.sleep(1)
+            # Send Keep-Alive debug message every minute
+            if time.time() > ts + 60:
+                with self.lock:
+                    self.logger.info("Manager is still alive")
+                ts += 60
+            time.sleep(.1)
+
+    def quit(self):
+        for r in self.daemons:
+            self.daemons[r].kill_daemon()
+        self.logger.debug("KILLED BOT by user!")
 
 
 if __name__ == '__main__':
+    PROCESSES = 5
+    manager = TrafficBotInstanceManager(PROCESSES)
     try:
-        manager = TrafficBotInstanceManager(4)
         manager.run()
     except KeyboardInterrupt:
-        pass
+        manager.quit()
     finally:
         sys.exit()

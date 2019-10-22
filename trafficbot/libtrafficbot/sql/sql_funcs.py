@@ -2,23 +2,9 @@ import time
 from datetime import datetime
 from threading import RLock
 
-from pymysqlpool import ConnectionPool
-
 
 INSERTION_LOCK_STREAM = RLock()
 INSERTION_LOCK_SESSIONS = RLock()
-
-
-def create_connection_pool(bot_id=None):
-    return ConnectionPool(
-        host='127.0.0.1',
-        user='arnedevXY' if bot_id == 10 else f'trafficbot{bot_id}',
-        password='hsv4ever!',
-        db='trafficbot',
-        autocommit=True,
-        size=10,
-        charset="utf8"
-    )
 
 
 def time_to_db_time(any_time=None):
@@ -53,7 +39,7 @@ def get_all_ref_sites(pool):
             "SELECT id, domain FROM websites "
             "WHERE enabled = 1"
         )
-        output = curs.fetchall()
+        return curs.fetchall()
 
 
 def get_website_settings_sql(pool):
@@ -139,7 +125,7 @@ def update_bot_sessions_finish_sql(pool, cookies, clicked_banner, last_inserted_
     return True
 
 
-def update_traffic_stream(pool, session_id, url, locator):
+def update_traffic_stream(pool, session_id, url):
     with INSERTION_LOCK_STREAM:
         with pool.get_connection() as curs:
             curs.execute(
@@ -164,15 +150,16 @@ def proxy_ext_ip_was_used(pool, ext_ip):
 def get_geoip_info_sql(pool, proxy, ext_ip):
     with pool.get_connection() as curs:
         curs.execute(
-            f'SELECT country, language, user_agent, cookies, mobile_traffic, id FROM bot_sessions '
+            f'SELECT country, language, user_agent, cookies, mobile_traffic, id, screen_x, screen_y FROM bot_sessions '
             f'WHERE proxy_address = %s AND external_ip = %s  ORDER BY id DESC LIMIT 10', (proxy, ext_ip)
         )
         result = curs.fetchall()[0]
     return {
         'country': result[0],
         'language': result[1],
-        'user_agent': result[2][1:-1] if result[2] is not None else None,
+        'user_agent': result[2][1:-1] if result[2] else None,
         'cookies': result[3],
         'is_mobile': True if result[4] is 1 else False,
         'session_id': result[5],
+        'screen_size': (result[6], result[7])
     }
