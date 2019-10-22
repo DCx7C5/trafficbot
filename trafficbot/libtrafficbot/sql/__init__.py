@@ -1,10 +1,10 @@
 from pymysqlpool import ConnectionPool
 
 
-def create_connection_pool(bot_id=None):
+def create_connection_pool():
     return ConnectionPool(
         host='127.0.0.1',
-        user='arnedevXY' if bot_id == 10 else f'trafficbot{bot_id}',
+        user='arnedevXY',
         password='hsv4ever!',
         db='trafficbot',
         autocommit=True,

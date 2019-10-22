@@ -1,59 +1,35 @@
+import logging
 import os
 import sys
 import time
 import json
 import pickle
-import logging
 import requests
-import coloredlogs
 import threading
+import libtrafficbot.log
 import multiprocessing as mp
 from socks import ProxyError
-from secrets import SystemRandom
+from libtrafficbot import sec
 from pyvirtualdisplay import Display
 from selenium.webdriver import Firefox
+
 from libtrafficbot.blocked import BLOCKED
 from user_agent import generate_user_agent
 from selenium.webdriver.common.by import By
 from selenium.webdriver import FirefoxProfile
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.remote.remote_connection import LOGGER
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (WebDriverException, ElementNotInteractableException,
                                         JavascriptException, NoSuchElementException, ElementClickInterceptedException)
 from urllib3.exceptions import InsecureRequestWarning
-
 from libtrafficbot.bot_helper import calculate_chance_weight_based, choose_fair, is_xpath_locator
 from libtrafficbot.sql import database_connection_pool as db_pool
 from libtrafficbot.sql.sql_funcs import (get_website_settings_sql, update_bot_sessions_finish_sql,
                                          update_bot_sessions_start_sql, get_referrer_links_sql,
                                          get_website_locators_sql, proxy_ext_ip_was_used, get_geoip_info_sql)
-
-sec = SystemRandom()
-
-LOGGER.setLevel(logging.WARNING)
+logger = libtrafficbot.log.logger
 CWD = os.getcwd()
-
-logger = logging.getLogger('TRAFFICBOT')
-
-u_log = logging.getLogger('urllib3')
-u_log.setLevel(logging.CRITICAL)
-
-s_log = logging.getLogger('socks')
-s_log.setLevel(logging.WARNING)
-
-e_log = logging.getLogger('easyprocess')
-e_log.setLevel(logging.WARNING)
-
-p_log = logging.getLogger('pyvirtualdisplay')
-p_log.setLevel(logging.CRITICAL)
-
-coloredlogs.install(
-    level=logging.DEBUG,
-    fmt=f'%(asctime)-20s- %(name)-31s - %(process)-6s- %(levelname)-7s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
 
 
 PROXIES = [
@@ -253,12 +229,14 @@ class TrafficBot(mp.Process):
         self.pickled_profile = pickle.dumps(profile)
 
         self.xvfb = self.create_display()
-
-        self.driver = Firefox(
-            executable_path=f"{CWD}/firefox/driver/geckodriver",
-            firefox_binary=f"{CWD}/firefox/binary/firefox-bin",
-            firefox_profile=profile,
-        )
+        try:
+            self.driver = Firefox(
+                executable_path=f"{CWD}/firefox/driver/geckodriver",
+                firefox_binary=f"{CWD}/firefox/binary/firefox-bin",
+                firefox_profile=profile,
+            )
+        except WebDriverException:
+            return False
         self.driver.set_page_load_timeout(125)
         if self.was_used and self.info_dict['cookies']:
             cookie_list = json.loads(self.info_dict['cookies'])
@@ -885,7 +863,7 @@ class TrafficBotInstanceManager:
         for PXY in PROXIES:
             proxy_queue.put(PXY)
 
-        self.database_connection = db_pool(str(10))
+        self.database_connection = db_pool
 
     def start_daemon(self, x):
         if isinstance(x, int):
